@@ -1,0 +1,262 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:battery_plus/battery_plus.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:crypto/crypto.dart';
+import 'package:device_info_plus/device_info_plus.dart';
+import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  final SupabaseClient _client = Supabase.instance.client;
+  final TextEditingController _code = TextEditingController();
+  String? _deviceId;
+  String? _error;
+  bool _loading = true;
+  bool _busy = false;
+  DateTime? _lastSync;
+  String _model = '-';
+  String _android = '-';
+  String _network = '-';
+  int? _battery;
+  Timer? _timer;
+
+  String get _prefKey => 'device_id_${_client.auth.currentUser?.id}';
+
+  @override
+  void initState() {
+    super.initState();
+    _init();
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _code.dispose();
+    super.dispose();
+  }
+
+  Future<void> _init() async {
+    final prefs = await SharedPreferences.getInstance();
+    _deviceId = prefs.getString(_prefKey);
+    if (mounted) setState(() => _loading = false);
+    if (_deviceId != null) {
+      _startTimer();
+      await _sync();
+    }
+  }
+
+  void _startTimer() {
+    _timer?.cancel();
+    _timer = Timer.periodic(const Duration(seconds: 60), (_) => _sync());
+  }
+
+  Future<void> _pair() async {
+    final raw = _code.text.toUpperCase().replaceAll(RegExp(r'[^A-Z0-9]'), '');
+    if (raw.length != 8) {
+      setState(() => _error = 'Enter the 8-character code from the website.');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final hash = sha256.convert(utf8.encode(raw)).toString();
+      final result = await _client.rpc('redeem_pairing_code', params: {'p_code_hash': hash});
+      final id = result as String;
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_prefKey, id);
+      await _client.from('activity_logs').insert({
+        'user_id': _client.auth.currentUser!.id,
+        'device_id': id,
+        'action': 'Device paired from the companion app',
+      });
+      _deviceId = id;
+      _code.clear();
+      _startTimer();
+      await _sync();
+    } on PostgrestException catch (e) {
+      _error = e.message.contains('Invalid')
+          ? 'That code is invalid or has expired. Create a new one on the website.'
+          : e.message;
+    } catch (_) {
+      _error = 'Pairing failed. Check your connection and try again.';
+    }
+    if (mounted) setState(() => _busy = false);
+  }
+
+  Future<void> _sync() async {
+    final id = _deviceId;
+    if (id == null) return;
+    try {
+      final android = await DeviceInfoPlugin().androidInfo;
+      final battery = await Battery().batteryLevel;
+      final net = await Connectivity().checkConnectivity();
+      final network = net.contains(ConnectivityResult.wifi)
+          ? 'Wi-Fi'
+          : net.contains(ConnectivityResult.mobile)
+              ? 'Mobile data'
+              : net.contains(ConnectivityResult.none)
+                  ? 'Offline'
+                  : 'Other';
+      final now = DateTime.now();
+      final rows = await _client.from('devices').update({
+        'model': android.model,
+        'android_version': android.version.release,
+        'battery_level': battery,
+        'network_type': network,
+        'connection_status': 'CONNECTED',
+        'last_seen': now.toUtc().toIso8601String(),
+      }).eq('id', id).select('id');
+      if (rows.isEmpty) {
+        await _clearPairing('This phone was revoked from ZAYTLINK. Pair it again with a new code.');
+        return;
+      }
+      if (!mounted) return;
+      setState(() {
+        _model = android.model;
+        _android = android.version.release;
+        _battery = battery;
+        _network = network;
+        _lastSync = now;
+        _error = null;
+      });
+    } catch (_) {
+      if (mounted) setState(() => _error = 'Could not sync. Check your internet connection.');
+    }
+  }
+
+  Future<void> _clearPairing(String? message) async {
+    _timer?.cancel();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_prefKey);
+    if (!mounted) return;
+    setState(() {
+      _deviceId = null;
+      _lastSync = null;
+      _error = message;
+    });
+  }
+
+  Future<void> _unpair() async {
+    final id = _deviceId;
+    if (id == null) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => AlertDialog(
+        title: const Text('Unpair this phone?'),
+        content: const Text('It will show as Disconnected on the website until you pair it again with a new code.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Unpair')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await _client.from('devices').update({'connection_status': 'DISCONNECTED'}).eq('id', id);
+    } catch (_) {}
+    await _clearPairing(null);
+  }
+
+  Widget _card(Widget child) => Card(
+        color: const Color(0xFF14211B),
+        margin: const EdgeInsets.only(bottom: 16),
+        child: Padding(padding: const EdgeInsets.all(16), child: child),
+      );
+
+  Widget _row(String label, String value) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(label, style: const TextStyle(color: Color(0xFF91A49A))),
+            Text(value),
+          ],
+        ),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('ZAYTLINK', style: TextStyle(letterSpacing: 4, fontSize: 16)),
+        backgroundColor: const Color(0xFF101915),
+        actions: [
+          IconButton(
+            tooltip: 'Sign out',
+            icon: const Icon(Icons.logout),
+            onPressed: () async {
+              _timer?.cancel();
+              await _client.auth.signOut();
+            },
+          ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          if (_error != null)
+            _card(Text(_error!, style: const TextStyle(color: Color(0xFFE8AE48)))),
+          if (_deviceId == null)
+            _card(Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('Pair this phone', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 16)),
+                const SizedBox(height: 8),
+                const Text(
+                  'On the ZAYTLINK website open My Device, tap Pair a device, and enter the one-time code here.',
+                  style: TextStyle(color: Color(0xFF91A49A)),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _code,
+                  textCapitalization: TextCapitalization.characters,
+                  decoration: const InputDecoration(labelText: 'Pairing code (XXXX-XXXX)', border: OutlineInputBorder()),
+                ),
+                const SizedBox(height: 12),
+                FilledButton(onPressed: _busy ? null : _pair, child: Text(_busy ? 'Pairing...' : 'Pair this phone')),
+              ],
+            ))
+          else
+            _card(Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('Connected to ZAYTLINK', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 16, color: Color(0xFF35C98B))),
+                const SizedBox(height: 8),
+                _row('Model', _model),
+                _row('Android version', _android),
+                _row('Battery', _battery == null ? '-' : '$_battery%'),
+                _row('Network', _network),
+                _row('Last sync', _lastSync == null ? 'Not yet' : TimeOfDay.fromDateTime(_lastSync!).format(context)),
+                const SizedBox(height: 12),
+                OutlinedButton(onPressed: _sync, child: const Text('Sync now')),
+                const SizedBox(height: 8),
+                OutlinedButton(onPressed: _unpair, child: const Text('Unpair this phone')),
+                const SizedBox(height: 8),
+                const Text(
+                  'Syncs every minute while this app is open. Background syncing is not built yet.',
+                  style: TextStyle(color: Color(0xFF91A49A), fontSize: 12),
+                ),
+              ],
+            )),
+          _card(const Text(
+            'Only your phone model, Android version, battery level and network type are shared. Camera, location, files and apps are never accessed.',
+            style: TextStyle(color: Color(0xFF91A49A), fontSize: 12),
+          )),
+        ],
+      ),
+    );
+  }
+}
