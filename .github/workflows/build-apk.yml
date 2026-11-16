@@ -30,13 +30,24 @@ jobs:
           flutter pub add supabase_flutter battery_plus device_info_plus connectivity_plus crypto shared_preferences
           sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <application|' android/app/src/main/AndroidManifest.xml
 
-      - name: Build release APK
+      - name: Check the Dart code
         run: |
           cd app
-          flutter build apk --release
+          flutter analyze --no-fatal-infos --no-fatal-warnings lib
+
+      - name: Build APK
+        shell: bash
+        run: |
+          cd app
+          flutter build apk --debug 2>&1 | tee build.log
+
+      - name: Show error summary
+        if: failure()
+        run: |
+          cd app
+          grep -n -B2 -A12 "What went wrong" build.log 2>/dev/null || tail -n 60 build.log 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         with:
           name: zaytlink-apk
-          path: app/build/app/outputs/flutter-apk/app-release.apk
-
+          path: app/build/app/outputs/flutter-apk/app-debug.apk
