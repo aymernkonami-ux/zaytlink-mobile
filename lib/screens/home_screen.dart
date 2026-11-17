@@ -177,7 +177,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<int> _uploadApps() async {
     final id = _deviceId;
     if (id == null) return 0;
-    final apps = await InstalledApps.getInstalledApps(true, false);
+    final apps = await InstalledApps.getInstalledApps();
     final userId = _client.auth.currentUser!.id;
     final rows = apps
         .map((a) => {'user_id': userId, 'device_id': id, 'package_name': a.packageName, 'app_name': a.name})
