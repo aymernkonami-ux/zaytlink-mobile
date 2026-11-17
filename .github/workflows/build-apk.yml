@@ -27,8 +27,8 @@ jobs:
           rm -rf app/lib
           cp -r lib app/lib
           cd app
-          flutter pub add supabase_flutter battery_plus device_info_plus connectivity_plus crypto shared_preferences
-          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <application|' android/app/src/main/AndroidManifest.xml
+          flutter pub add supabase_flutter battery_plus device_info_plus connectivity_plus crypto shared_preferences disk_space_plus installed_apps geolocator
+          sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>\n    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>\n    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>\n    <application|' android/app/src/main/AndroidManifest.xml
 
       - name: Check the Dart code
         run: |
@@ -39,7 +39,7 @@ jobs:
         shell: bash
         run: |
           cd app
-          flutter build apk --debug 2>&1 | tee build.log
+          flutter build apk --debug --target-platform android-arm64 2>&1 | tee build.log
 
       - name: Show error summary
         if: failure()
