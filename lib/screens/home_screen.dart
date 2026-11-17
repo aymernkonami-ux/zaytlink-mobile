@@ -5,9 +5,14 @@ import 'package:battery_plus/battery_plus.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:crypto/crypto.dart';
 import 'package:device_info_plus/device_info_plus.dart';
+import 'package:disk_space_plus/disk_space_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:installed_apps/installed_apps.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+
+const int companionVersion = 2;
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -21,16 +26,22 @@ class _HomeScreenState extends State<HomeScreen> {
   final TextEditingController _code = TextEditingController();
   String? _deviceId;
   String? _error;
+  String? _lastAction;
   bool _loading = true;
   bool _busy = false;
+  bool _polling = false;
+  bool _locationAllowed = false;
   DateTime? _lastSync;
   String _model = '-';
   String _android = '-';
   String _network = '-';
+  String _storage = '-';
   int? _battery;
-  Timer? _timer;
+  Timer? _syncTimer;
+  Timer? _commandTimer;
 
   String get _prefKey => 'device_id_${_client.auth.currentUser?.id}';
+  String get _locationKey => 'location_allowed_${_client.auth.currentUser?.id}';
 
   @override
   void initState() {
@@ -40,7 +51,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
-    _timer?.cancel();
+    _syncTimer?.cancel();
+    _commandTimer?.cancel();
     _code.dispose();
     super.dispose();
   }
@@ -48,16 +60,28 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _init() async {
     final prefs = await SharedPreferences.getInstance();
     _deviceId = prefs.getString(_prefKey);
+    _locationAllowed = prefs.getBool(_locationKey) ?? false;
     if (mounted) setState(() => _loading = false);
     if (_deviceId != null) {
-      _startTimer();
+      _startTimers();
       await _sync();
+      try {
+        await _uploadApps();
+      } catch (_) {}
     }
   }
 
-  void _startTimer() {
-    _timer?.cancel();
-    _timer = Timer.periodic(const Duration(seconds: 60), (_) => _sync());
+  void _startTimers() {
+    _syncTimer?.cancel();
+    _commandTimer?.cancel();
+    _syncTimer = Timer.periodic(const Duration(seconds: 60), (_) => _sync());
+    _commandTimer = Timer.periodic(const Duration(seconds: 5), (_) => _pollCommands());
+  }
+
+  Future<void> _setLocationAllowed(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_locationKey, value);
+    if (mounted) setState(() => _locationAllowed = value);
   }
 
   Future<void> _pair() async {
@@ -83,8 +107,11 @@ class _HomeScreenState extends State<HomeScreen> {
       });
       _deviceId = id;
       _code.clear();
-      _startTimer();
+      _startTimers();
       await _sync();
+      try {
+        await _uploadApps();
+      } catch (_) {}
     } on PostgrestException catch (e) {
       _error = e.message.contains('Invalid')
           ? 'That code is invalid or has expired. Create a new one on the website.'
@@ -94,6 +121,8 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     if (mounted) setState(() => _busy = false);
   }
+
+  String _gb(num bytes) => (bytes / (1024 * 1024 * 1024)).toStringAsFixed(1);
 
   Future<void> _sync() async {
     final id = _deviceId;
@@ -109,12 +138,20 @@ class _HomeScreenState extends State<HomeScreen> {
               : net.contains(ConnectivityResult.none)
                   ? 'Offline'
                   : 'Other';
+      final disk = DiskSpacePlus();
+      final freeMb = await disk.getFreeDiskSpace;
+      final totalMb = await disk.getTotalDiskSpace;
+      final freeBytes = freeMb == null ? null : (freeMb * 1024 * 1024).round();
+      final totalBytes = totalMb == null ? null : (totalMb * 1024 * 1024).round();
       final now = DateTime.now();
       final rows = await _client.from('devices').update({
         'model': android.model,
         'android_version': android.version.release,
         'battery_level': battery,
         'network_type': network,
+        'storage_free_bytes': freeBytes,
+        'storage_total_bytes': totalBytes,
+        'companion_version': companionVersion,
         'connection_status': 'CONNECTED',
         'last_seen': now.toUtc().toIso8601String(),
       }).eq('id', id).select('id');
@@ -128,6 +165,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _android = android.version.release;
         _battery = battery;
         _network = network;
+        _storage = (freeBytes == null || totalBytes == null) ? '-' : '${_gb(freeBytes)} GB free of ${_gb(totalBytes)} GB';
         _lastSync = now;
         _error = null;
       });
@@ -136,8 +174,94 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Future<int> _uploadApps() async {
+    final id = _deviceId;
+    if (id == null) return 0;
+    final apps = await InstalledApps.getInstalledApps(true, false);
+    final userId = _client.auth.currentUser!.id;
+    final rows = apps
+        .map((a) => {'user_id': userId, 'device_id': id, 'package_name': a.packageName, 'app_name': a.name})
+        .toList();
+    await _client.from('device_apps').delete().eq('device_id', id);
+    if (rows.isNotEmpty) await _client.from('device_apps').insert(rows);
+    return rows.length;
+  }
+
+  Future<Map<String, dynamic>> _locate() async {
+    if (!_locationAllowed) throw Exception('Location requests are turned off in the phone app.');
+    if (!await Geolocator.isLocationServiceEnabled()) throw Exception('Turn on Location on the phone.');
+    var permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) permission = await Geolocator.requestPermission();
+    if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
+      throw Exception('Location permission was denied on the phone.');
+    }
+    final pos = await Geolocator.getCurrentPosition(
+      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high, timeLimit: Duration(seconds: 20)),
+    );
+    return {
+      'lat': pos.latitude,
+      'lng': pos.longitude,
+      'accuracy': pos.accuracy,
+      'at': DateTime.now().toUtc().toIso8601String(),
+    };
+  }
+
+  Future<void> _handle(Map<String, dynamic> cmd) async {
+    final id = cmd['id'] as String;
+    final name = cmd['command'] as String;
+    final payload = cmd['payload'] is Map ? Map<String, dynamic>.from(cmd['payload'] as Map) : <String, dynamic>{};
+    try {
+      Map<String, dynamic> result = {};
+      if (name == 'launch_app') {
+        final pkg = payload['package'] as String?;
+        if (pkg == null || pkg.isEmpty) throw Exception('No app was selected.');
+        final ok = await InstalledApps.startApp(pkg);
+        if (ok != true) throw Exception('The phone could not open that app.');
+        result = {'package': pkg};
+        if (mounted) setState(() => _lastAction = 'Opened an app requested from the website');
+      } else if (name == 'refresh_apps') {
+        result = {'count': await _uploadApps()};
+        if (mounted) setState(() => _lastAction = 'Sent your app list to the website');
+      } else if (name == 'get_location') {
+        result = await _locate();
+        if (mounted) setState(() => _lastAction = 'Sent your location to the website');
+      } else {
+        throw Exception('Unknown request.');
+      }
+      await _client.from('device_commands').update({'status': 'done', 'result': result}).eq('id', id);
+    } catch (e) {
+      final text = e.toString().replaceFirst('Exception: ', '');
+      await _client.from('device_commands').update({'status': 'failed', 'error': text}).eq('id', id);
+    }
+  }
+
+  Future<void> _pollCommands() async {
+    final id = _deviceId;
+    if (id == null || _polling) return;
+    _polling = true;
+    try {
+      final since = DateTime.now().toUtc().subtract(const Duration(minutes: 2)).toIso8601String();
+      final rows = await _client
+          .from('device_commands')
+          .select()
+          .eq('device_id', id)
+          .eq('status', 'pending')
+          .gt('created_at', since)
+          .order('created_at')
+          .limit(5);
+      for (final row in rows) {
+        await _handle(Map<String, dynamic>.from(row as Map));
+      }
+    } catch (_) {
+      // Ignore: the next poll will try again.
+    } finally {
+      _polling = false;
+    }
+  }
+
   Future<void> _clearPairing(String? message) async {
-    _timer?.cancel();
+    _syncTimer?.cancel();
+    _commandTimer?.cancel();
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_prefKey);
     if (!mounted) return;
@@ -181,7 +305,7 @@ class _HomeScreenState extends State<HomeScreen> {
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             Text(label, style: const TextStyle(color: Color(0xFF91A49A))),
-            Text(value),
+            Flexible(child: Text(value, textAlign: TextAlign.end)),
           ],
         ),
       );
@@ -198,7 +322,8 @@ class _HomeScreenState extends State<HomeScreen> {
             tooltip: 'Sign out',
             icon: const Icon(Icons.logout),
             onPressed: () async {
-              _timer?.cancel();
+              _syncTimer?.cancel();
+              _commandTimer?.cancel();
               await _client.auth.signOut();
             },
           ),
@@ -207,8 +332,7 @@ class _HomeScreenState extends State<HomeScreen> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          if (_error != null)
-            _card(Text(_error!, style: const TextStyle(color: Color(0xFFE8AE48)))),
+          if (_error != null) _card(Text(_error!, style: const TextStyle(color: Color(0xFFE8AE48)))),
           if (_deviceId == null)
             _card(Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -229,7 +353,7 @@ class _HomeScreenState extends State<HomeScreen> {
                 FilledButton(onPressed: _busy ? null : _pair, child: Text(_busy ? 'Pairing...' : 'Pair this phone')),
               ],
             ))
-          else
+          else ...[
             _card(Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
@@ -239,20 +363,30 @@ class _HomeScreenState extends State<HomeScreen> {
                 _row('Android version', _android),
                 _row('Battery', _battery == null ? '-' : '$_battery%'),
                 _row('Network', _network),
+                _row('Storage', _storage),
                 _row('Last sync', _lastSync == null ? 'Not yet' : TimeOfDay.fromDateTime(_lastSync!).format(context)),
+                if (_lastAction != null) _row('Last request', _lastAction!),
                 const SizedBox(height: 12),
                 OutlinedButton(onPressed: _sync, child: const Text('Sync now')),
                 const SizedBox(height: 8),
                 OutlinedButton(onPressed: _unpair, child: const Text('Unpair this phone')),
                 const SizedBox(height: 8),
                 const Text(
-                  'Syncs every minute while this app is open. Background syncing is not built yet.',
+                  'Keep this app open. It syncs every minute and checks for website requests every few seconds. Background running is not built yet.',
                   style: TextStyle(color: Color(0xFF91A49A), fontSize: 12),
                 ),
               ],
             )),
+            _card(SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Allow location requests'),
+              subtitle: const Text('Off by default. When on, the website can ask for your location once per request.'),
+              value: _locationAllowed,
+              onChanged: _setLocationAllowed,
+            )),
+          ],
           _card(const Text(
-            'Only your phone model, Android version, battery level and network type are shared. Camera, location, files and apps are never accessed.',
+            'Shared with your account: model, Android version, battery, network, storage, the list of installed apps, and your location only when you allow it. Camera, files and messages are never accessed.',
             style: TextStyle(color: Color(0xFF91A49A), fontSize: 12),
           )),
         ],
